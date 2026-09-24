@@ -41,7 +41,7 @@ from aegis_redteam.attacker import Attacker
 from aegis_redteam.feedback import build_patch_proposals, render_proposals_markdown
 from aegis_redteam.gcp_logging import ATTACK_SEVERITY_TO_LOG_LEVEL, get_logger, log
 from aegis_redteam.judge import Judge
-from aegis_redteam.llm import get_backend
+from aegis_redteam.llm import get_attacker_backend, get_backend
 from aegis_redteam.orchestrator import Orchestrator
 from aegis_redteam.report import build_report
 from aegis_redteam.store import Store
@@ -49,7 +49,9 @@ from aegis_redteam.target import HTTPTarget
 
 TRIGGER_KEY = os.environ.get("TRIGGER_KEY", "")
 BLUE_TEAM_URL = os.environ.get("BLUE_TEAM_URL", "")
-BLUE_TEAM_TOKEN = os.environ.get("BLUE_TEAM_TOKEN", "")
+BLUE_TEAM_TOKEN = os.environ.get("BLUE_TEAM_TOKEN", "")  # legacy static-token mode (v1 mock only)
+BLUE_TEAM_USER_ID = os.environ.get("BLUE_TEAM_USER_ID", "")  # session-login mode (aegis-blue-team-v2)
+BLUE_TEAM_PASSWORD = os.environ.get("BLUE_TEAM_PASSWORD", "")
 PORT = int(os.environ.get("PORT", 8080))
 SEEDS_PATH = Path(__file__).parent / "seeds.json"
 
@@ -57,12 +59,18 @@ _logger = get_logger(__name__)
 
 
 def run_campaign(run_id: str, mode: str, max_turns: int, on_event=None) -> dict:
-    backend = get_backend()  # Vertex Gemini/Claude if VERTEX_PROJECT is set, else Anthropic API if ANTHROPIC_API_KEY is set, else mock
+    backend = get_backend()  # judge: Vertex Gemini/Claude if VERTEX_PROJECT is set, else Anthropic API if ANTHROPIC_API_KEY is set, else mock
+    attacker_backend = get_attacker_backend()  # ATTACKER_MODEL if set, else the same as the judge
+    # BLUE_TEAM_URL is the target's *base* URL; HTTPTarget appends /login and /chat.
+    target = HTTPTarget(base_url=BLUE_TEAM_URL, user_id=BLUE_TEAM_USER_ID,
+                        password=BLUE_TEAM_PASSWORD, token=BLUE_TEAM_TOKEN)
     log(_logger, "INFO", "job_started",
         event="job_started", run_id=run_id, mode=mode, max_turns=max_turns,
-        backend=backend.name, blue_team_url=BLUE_TEAM_URL)
-    target = HTTPTarget(url=BLUE_TEAM_URL, token=BLUE_TEAM_TOKEN)
-    attacker = Attacker(backend)
+        backend=backend.name, judge_model=getattr(backend, "model", None),
+        attacker_backend=attacker_backend.name, attacker_model=getattr(attacker_backend, "model", None),
+        blue_team_url=BLUE_TEAM_URL,
+        blue_team_auth_mode=target.auth_mode, blue_team_user_id=BLUE_TEAM_USER_ID or None)
+    attacker = Attacker(attacker_backend)
     judge = Judge(backend)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -91,6 +99,28 @@ def run_campaign(run_id: str, mode: str, max_turns: int, on_event=None) -> dict:
     # here in structured form.
     max_severity = max((f["severity"] for f in findings), default=0)
     violated_count = sum(1 for f in findings if f["violated"])
+    inconclusive_count = sum(1 for f in findings if f.get("status") == "inconclusive")
+    tested_count = len(findings) - inconclusive_count
+    attacker_turns = sum(f.get("attacker_turns", 0) for f in findings)
+    attacker_refusals = sum(f.get("attacker_refusals", 0) for f in findings)
+    attacker_errors = sum(f.get("attacker_errors", 0) for f in findings)
+    refusal_rate_pct = round(attacker_refusals / attacker_turns * 100, 1) if attacker_turns else 0
+    fallback_rate_pct = round((attacker_refusals + attacker_errors) / attacker_turns * 100, 1) if attacker_turns else 0
+    stats = {
+        "total": tested_count,              # seeds that actually reached the target
+        "seed_count": len(findings),
+        "inconclusive": inconclusive_count,
+        "violated": violated_count,
+        "success_rate_pct": round(violated_count / tested_count * 100, 1) if tested_count else 0,
+        "attacker_turns": attacker_turns,
+        "attacker_refusals": attacker_refusals,
+        "attacker_refusal_rate_pct": refusal_rate_pct,
+        "attacker_errors": attacker_errors,
+        "run_valid": inconclusive_count == 0 and fallback_rate_pct <= 20,
+        "judge_model": getattr(backend, "model", None),
+        "attacker_backend": attacker_backend.name,
+        "attacker_model": getattr(attacker_backend, "model", None),
+    }
     log(
         _logger,
         ATTACK_SEVERITY_TO_LOG_LEVEL.get(max_severity, "INFO") if violated_count else "INFO",
@@ -99,9 +129,7 @@ def run_campaign(run_id: str, mode: str, max_turns: int, on_event=None) -> dict:
         run_id=rid,
         mode=mode,
         backend=backend.name,
-        total=len(findings),
-        violated=violated_count,
-        success_rate_pct=round(violated_count / len(findings) * 100, 1) if findings else 0,
+        **stats,
         max_severity=max_severity,
         findings=[
             {
@@ -109,6 +137,9 @@ def run_campaign(run_id: str, mode: str, max_turns: int, on_event=None) -> dict:
                 "category": f["category"],
                 "goal": f["goal"],
                 "violated": f["violated"],
+                "status": f.get("status"),
+                "attacker_refusals": f.get("attacker_refusals", 0),
+                "attacker_errors": f.get("attacker_errors", 0),
                 "severity": f["severity"],
                 "rationale": f["rationale"],
                 "turns_to_success": f["turns_to_success"],
@@ -123,8 +154,7 @@ def run_campaign(run_id: str, mode: str, max_turns: int, on_event=None) -> dict:
         "run_id": rid,
         "mode": mode,
         "backend": backend.name,
-        "total": len(findings),
-        "violated": sum(1 for f in findings if f["violated"]),
+        **stats,
         "findings": findings,
         "proposals_markdown": render_proposals_markdown(proposals),
         "report_html": report_html,
@@ -190,9 +220,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         streaming = urllib.parse.parse_qs(parsed.query).get("stream", ["0"])[0] in ("1", "true", "yes") or bool(body.get("stream"))
         if not streaming:
             try:
-                self._send_json(200, run_campaign(run_id, mode, max_turns))
+                result = run_campaign(run_id, mode, max_turns)
             except Exception as exc:  # noqa: BLE001 -- surface the real error to the caller
-                self._send_json(500, {"error": str(exc)})
+                # Log first, so the real cause survives even if the caller is gone.
+                log(_logger, "ERROR", "job_failed", event="job_failed", run_id=run_id,
+                    error=str(exc), error_type=type(exc).__name__)
+                try:
+                    self._send_json(500, {"error": str(exc)})
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
+                return
+            try:
+                self._send_json(200, result)
+            except (BrokenPipeError, ConnectionError, OSError) as exc:
+                log(_logger, "WARNING", "client_disconnected", event="client_disconnected",
+                    run_id=run_id, error=str(exc))
             return
 
         # Streaming mode: plain NDJSON, one line per action the moment it
@@ -238,19 +280,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
+        # If the client connection dies mid-campaign (e.g. Cloud Run's request
+        # timeout), stop writing to it but let the campaign finish, so every
+        # seed still runs and campaign_result is still logged.
+        stream_state = {"dead": False}
+
         def _write_chunk(obj):
+            if stream_state["dead"]:
+                return
             data = (json.dumps(obj, default=str) + "\n").encode()
-            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionError, OSError) as exc:
+                stream_state["dead"] = True
+                log(_logger, "WARNING", "stream_client_disconnected",
+                    event="stream_client_disconnected", run_id=run_id, error=str(exc))
 
         try:
             result = run_campaign(run_id, mode, max_turns, on_event=_write_chunk)
             _write_chunk({"event": "result", **result})
         except Exception as exc:  # noqa: BLE001
+            log(_logger, "ERROR", "job_failed", event="job_failed", run_id=run_id,
+                error=str(exc), error_type=type(exc).__name__)
             _write_chunk({"event": "error", "error": str(exc)})
         finally:
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            if not stream_state["dead"]:
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s\n" % (fmt % args))

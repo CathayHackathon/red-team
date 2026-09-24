@@ -136,40 +136,93 @@ class MockAegisTarget(Target):
 
 
 class HTTPTarget(Target):
-    """Adapter for the real AegisOps agent once it exposes an HTTP endpoint.
+    """Adapter for the real AegisOps agent over HTTP.
 
-    Point `url` at a POST endpoint accepting
-    {"messages": [{"role": ..., "content": ...}]} and returning
-    {"reply": "..."}. `token`, if given, is sent as a Bearer token -- the
-    blue-team Cloud Run service checks this in app code (see
-    deploy/blue_team/app.py), since it's deliberately reachable over the
-    public internet at the Cloud Run IAM layer.
+    Two auth modes, chosen by which constructor args are non-empty:
+
+    - session-login mode (`user_id` + `password`): POST {base_url}/login,
+      cache the returned session token, send it as `Authorization: Bearer`
+      on {base_url}/chat, and re-login exactly once on a 401/403 in case the
+      session expired mid-campaign. Used for aegis-blue-team-v2. The
+      red-team logs in as a real low-privilege user (alice), never an admin,
+      so a privilege_escalation finding means something.
+    - legacy static-token mode (`token` only): static Bearer header on every
+      call to {base_url}/chat. Kept only for the retired v1 mock.
+
+    /chat accepts {"messages": [{"role", "content"}]} and returns {"reply"}.
     """
 
-    def __init__(self, url: str, token: str = ""):
-        self.url = url
-        self.token = token
+    _TOKEN_FIELDS = ("token", "session_token", "access_token")
+
+    def __init__(self, base_url: str, user_id: str = "", password: str = "", token: str = "", timeout: int = 60):
+        self.base_url = base_url.rstrip("/")
+        if self.base_url.endswith("/chat"):  # tolerate an old-style full /chat URL
+            self.base_url = self.base_url[: -len("/chat")]
+        self.user_id = user_id
+        self.password = password
+        self.static_token = token
+        self.timeout = timeout
+        self._session_token: Optional[str] = None
+
+    @property
+    def auth_mode(self) -> str:
+        if self.user_id and self.password:
+            return "session-login"
+        if self.static_token:
+            return "static-token"
+        return "none"
 
     def system_prompt(self) -> str:
         return "(remote target — system prompt not introspectable from here)"
 
     def apply_patch(self, category: str, addition: str) -> None:
         raise NotImplementedError(
-            "Applying a patch to a live remote target requires AegisOps's own "
-            "config-update endpoint; wire that up here once available."
+            "Patches for aegis-blue-team-v2 go through its own /proposals + "
+            "human-approval flow (PROPOSAL_TOKEN / APPROVAL_TOKEN), not a direct call."
         )
 
-    def respond(self, history: List[ChatMessage]) -> str:
+    def _post(self, path: str, body: dict, bearer: Optional[str] = None) -> dict:
         import json
         import urllib.request
 
-        payload = json.dumps(
-            {"messages": [{"role": m.role, "content": m.content} for m in history]}
-        ).encode()
         headers = {"Content-Type": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        req = urllib.request.Request(self.url, data=payload, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        req = urllib.request.Request(self.base_url + path, data=json.dumps(body).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read())
+
+    def _login(self) -> str:
+        data = self._post("/login", {"user_id": self.user_id, "password": self.password})
+        for key in self._TOKEN_FIELDS:
+            if data.get(key):
+                log(_logger, "INFO", "target_login", event="target_login", user_id=self.user_id)
+                return data[key]
+        raise RuntimeError(
+            f"/login response had no recognised token field (tried {self._TOKEN_FIELDS}); "
+            f"got keys: {sorted(data.keys())}"
+        )
+
+    def _bearer_token(self, force_relogin: bool = False) -> Optional[str]:
+        mode = self.auth_mode
+        if mode == "session-login":
+            if force_relogin or not self._session_token:
+                self._session_token = self._login()
+            return self._session_token
+        if mode == "static-token":
+            return self.static_token
+        return None
+
+    def respond(self, history: List[ChatMessage]) -> str:
+        import urllib.error
+
+        body = {"messages": [{"role": m.role, "content": m.content} for m in history]}
+        try:
+            data = self._post("/chat", body, self._bearer_token())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and self.auth_mode == "session-login":
+                log(_logger, "WARNING", "target_session_relogin", event="target_session_relogin", status=e.code)
+                data = self._post("/chat", body, self._bearer_token(force_relogin=True))
+            else:
+                raise
         return data["reply"]

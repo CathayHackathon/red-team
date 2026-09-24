@@ -27,6 +27,8 @@ def main(argv=None):
     run_p.add_argument("--run-id", default=None)
     run_p.add_argument("--max-turns", type=int, default=3)
     run_p.add_argument("--backend", choices=["auto", "anthropic", "mock"], default="auto")
+    run_p.add_argument("--no-attacker-fallback", action="store_true",
+                       help="If the attacker LLM refuses, skip the turn instead of sending the seed/deterministic mutation")
 
     report_p = sub.add_parser("report", help="Build an HTML report from a store")
     report_p.add_argument("--store", default="runs/findings.jsonl")
@@ -47,7 +49,7 @@ def main(argv=None):
             event="job_started", cmd="run", backend=backend.name, seeds_file=args.seeds,
             requested_run_id=args.run_id, max_turns=args.max_turns)
         target = MockAegisTarget()
-        attacker = Attacker(backend)
+        attacker = Attacker(backend, fallback_on_refusal=not args.no_attacker_fallback)
         judge = Judge(backend)
         store = Store(args.store)
         orch = Orchestrator(target, attacker, judge, store, max_turns=args.max_turns)

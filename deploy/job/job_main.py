@@ -24,7 +24,7 @@ from aegis_redteam.attacker import Attacker
 from aegis_redteam.feedback import build_patch_proposals, render_proposals_markdown
 from aegis_redteam.gcp_logging import get_logger, log
 from aegis_redteam.judge import Judge
-from aegis_redteam.llm import get_backend
+from aegis_redteam.llm import get_attacker_backend, get_backend
 from aegis_redteam.orchestrator import Orchestrator
 from aegis_redteam.report import build_report
 from aegis_redteam.store import Store
@@ -57,8 +57,12 @@ def main() -> None:
         requested_run_id=args.run_id, mode=args.mode, max_turns=args.max_turns)
 
     backend = get_backend()
-    target = HTTPTarget(url=blue_team_url, token=blue_team_token)
-    attacker = Attacker(backend)
+    # BLUE_TEAM_URL is the target's base URL; HTTPTarget appends /login and /chat.
+    target = HTTPTarget(base_url=blue_team_url,
+                        user_id=os.environ.get("BLUE_TEAM_USER_ID", ""),
+                        password=os.environ.get("BLUE_TEAM_PASSWORD", ""),
+                        token=blue_team_token)
+    attacker = Attacker(get_attacker_backend())
     judge = Judge(backend)
 
     with tempfile.TemporaryDirectory() as tmpdir:
