@@ -158,12 +158,13 @@ class VertexBackend(Backend):
 
     name = "vertex-claude"
 
-    def __init__(self, project: str, region: str = "global", model: str = "claude-sonnet-5"):
+    def __init__(self, project: str, region: str = "global", model: str = "claude-sonnet-5", max_tokens: int = 1024):
         if not project:
             raise ValueError("VertexBackend requires a GCP project id")
         self.project = project
         self.region = region
         self.model = model
+        self.max_tokens = max_tokens
 
     def _endpoint(self) -> str:
         if self.region == "global":
@@ -178,7 +179,7 @@ class VertexBackend(Backend):
     def chat(self, messages: List[ChatMessage], system: Optional[str] = None) -> str:
         body = {
             "anthropic_version": "vertex-2023-10-16",
-            "max_tokens": 1024,
+            "max_tokens": self.max_tokens,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
         }
         if system:
@@ -284,3 +285,24 @@ def get_backend(prefer: Optional[str] = None) -> Backend:
             pass
 
     return MockBackend()
+
+
+def get_attacker_backend() -> Backend:
+    """Backend for the attacker only.
+
+    If ATTACKER_MODEL is set (e.g. "claude-sonnet-5"), the attacker uses that
+    Vertex model -- Claude via VertexBackend for "claude-*" names, Gemini
+    otherwise -- while the judge keeps using get_backend() (VERTEX_MODEL).
+    Keeping them separate means a model picked for being willing to write
+    red-team test prompts never also grades its own attacks.
+    ATTACKER_REGION defaults to VERTEX_REGION (then "global"). Without
+    ATTACKER_MODEL this is just get_backend(), i.e. the old shared behaviour.
+    """
+    model = os.environ.get("ATTACKER_MODEL", "").strip()
+    project = os.environ.get("VERTEX_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not model or not project:
+        return get_backend()
+    region = os.environ.get("ATTACKER_REGION") or os.environ.get("VERTEX_REGION", "global")
+    if model.startswith("claude"):
+        return VertexBackend(project=project, region=region, model=model, max_tokens=600)
+    return VertexGeminiBackend(project=project, region=region, model=model)

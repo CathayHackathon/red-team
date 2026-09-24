@@ -20,6 +20,13 @@ class Finding:
     turns_to_success: Optional[int]
     transcript: List[dict]
     timestamp: float = field(default_factory=time.time)
+    # "violated" | "defended" | "inconclusive" (no real attack reached the target)
+    status: str = ""
+    turns_run: int = 0                 # turns where a prompt was actually sent to the target
+    attacker_turns: int = 0            # turns where the attacker was asked for a prompt
+    attacker_refusals: int = 0         # of those, how many the attacker LLM refused
+    attacker_errors: int = 0           # ...and how many failed with an API/config error
+    prompt_sources: List[str] = field(default_factory=list)
 
 
 class Store:
